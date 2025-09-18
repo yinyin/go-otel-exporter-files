@@ -10,28 +10,43 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/protobuf/proto"
 
+	otelexporterfiles "github.com/yinyin/go-otel-exporter-files"
 	"github.com/yinyin/go-otel-exporter-files/trace/internal/tracetransform"
 )
 
 const MaxRetainHours = 24 * 365 // 1 year
 
+const (
+	DefaultRetainHours   = 8
+	DefaultFileSizeLimit = 16 * 1024 * 1024
+)
+
+const purgeRangeCount = 2
+
 const timestampFormat = time.RFC3339
 
 var b32Enc = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv").WithPadding(base32.NoPadding)
 
+const outputHourMask = 0xFFFFFF
 const outputSnBoundary = 0x7FFFFFFD
 
-type FilesTraceExporter struct {
+type Config struct {
 	baseFolderPath string
 	retainHours    int32
 	fileSizeLimit  int
 	marshalOpts    proto.MarshalOptions
+}
 
+type FilesTraceExporter struct {
+	cfg Config
+
+	lckOutput         sync.Mutex
 	outputFolderPath  string
 	indexFilePath     string
 	outputHour        int32
@@ -41,6 +56,24 @@ type FilesTraceExporter struct {
 	outputStartAt     time.Time
 	outputLastWriteAt time.Time
 	currentSize       int
+}
+
+func NewFilesTraceExporter(options ...Option) (exporter *FilesTraceExporter, err error) {
+	cfg := Config{
+		retainHours:   DefaultRetainHours,
+		fileSizeLimit: DefaultFileSizeLimit,
+	}
+	for _, opt := range options {
+		cfg = opt.applyExporterOption(cfg)
+	}
+	if cfg.baseFolderPath == "" {
+		err = otelexporterfiles.ErrNeedBaseFolderPath
+		return
+	}
+	exporter = &FilesTraceExporter{
+		cfg: cfg,
+	}
+	return
 }
 
 func (x *FilesTraceExporter) writeTimestampFile() (err error) {
@@ -102,23 +135,23 @@ func (x *FilesTraceExporter) closeOutputFile() (err error) {
 func (x *FilesTraceExporter) makeOutputFolderPath(outputHour int32) string {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(outputHour))
-	return filepath.Join(x.baseFolderPath, b32Enc.EncodeToString(buf[1:]))
+	return filepath.Join(x.cfg.baseFolderPath, b32Enc.EncodeToString(buf[1:]))
 }
 
 // purgeRecentExpiredOutputFolders remove most two expired output folders.
 func (x *FilesTraceExporter) purgeRecentExpiredOutputFolders() (err error) {
-	if x.retainHours < 1 {
+	if x.cfg.retainHours < 1 {
 		return
 	}
 	currentHour := int32((time.Now().Unix() / 3600))
-	expiredHourBase := currentHour - x.retainHours - 1
+	expiredHourBase := currentHour - x.cfg.retainHours - 1
 	var errS []error
-	for i := 0; i < 2; i++ {
-		expiredHour := expiredHourBase - int32(i)
+	for purgeHourOffset := range purgeRangeCount {
+		expiredHour := expiredHourBase - int32(purgeHourOffset)
 		if expiredHour < 0 {
 			break
 		}
-		p := x.makeOutputFolderPath(expiredHour)
+		p := x.makeOutputFolderPath(expiredHour & outputHourMask)
 		if err0 := os.RemoveAll(p); nil != err0 {
 			errS = append(errS, fmt.Errorf("cannot remove expired output folder %q: %w", p, err0))
 		}
@@ -129,18 +162,26 @@ func (x *FilesTraceExporter) purgeRecentExpiredOutputFolders() (err error) {
 	return
 }
 
-func (x *FilesTraceExporter) prepareOutputFileName() {
-	if x.outputSn > 0xFFFF {
+func makeOutputFileName(outputSn int32) (outputFileName string) {
+	if outputSn > 0xFFFF {
 		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(x.outputSn))
-		x.outputFileName = b32Enc.EncodeToString(buf[:])
+		binary.BigEndian.PutUint32(buf[:], uint32(outputSn))
+		outputFileName = b32Enc.EncodeToString(buf[:])
 	} else {
 		var buf [2]byte
-		binary.BigEndian.PutUint16(buf[:], uint16(x.outputSn))
-		x.outputFileName = b32Enc.EncodeToString(buf[:])
+		binary.BigEndian.PutUint16(buf[:], uint16(outputSn))
+		outputFileName = b32Enc.EncodeToString(buf[:])
 	}
+	return
 }
 
+// prepareOutputFolder create output folder for given masked outputHour.
+//
+// The output folder will be create and set the following fields when os.MkdirAll succeed:
+// - x.outputFolderPath,
+// - x.indexFilePath,
+// - x.outputHour,
+// - x.outputSn.
 func (x *FilesTraceExporter) prepareOutputFolder(outputHour int32) (err error) {
 	p := x.makeOutputFolderPath(outputHour)
 	if err = os.MkdirAll(p, 0o755); nil != err {
@@ -155,9 +196,9 @@ func (x *FilesTraceExporter) prepareOutputFolder(outputHour int32) (err error) {
 }
 
 func (x *FilesTraceExporter) prepareOutputFp(recordSize int) (err error) {
-	outputHour := int32((time.Now().Unix() / 3600) & 0xFFFFFF)
+	outputHour := int32((time.Now().Unix() / 3600) & outputHourMask)
 	if outputHour == x.outputHour {
-		if (x.currentSize != 0) && ((x.currentSize + recordSize) <= x.fileSizeLimit) {
+		if (x.currentSize != 0) && ((x.currentSize + recordSize) >= x.cfg.fileSizeLimit) {
 			return
 		}
 		if err = x.closeOutputFile(); nil != err {
@@ -191,13 +232,14 @@ func (x *FilesTraceExporter) prepareOutputFp(recordSize int) (err error) {
 	if x.outputSn > outputSnBoundary {
 		return
 	}
-	x.prepareOutputFileName()
-	outputFilePath := filepath.Join(x.outputFolderPath, x.outputFileName)
+	outputFileName := makeOutputFileName(x.outputSn)
+	outputFilePath := filepath.Join(x.outputFolderPath, outputFileName)
 	fp, err := os.OpenFile(outputFilePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if nil != err {
 		err = fmt.Errorf("cannot create output file %q: %w", outputFilePath, err)
 		return
 	}
+	x.outputFileName = outputFileName
 	x.outputFp = fp
 	x.outputStartAt = time.Now().UTC()
 	x.outputLastWriteAt = x.outputStartAt
@@ -216,7 +258,7 @@ func (x *FilesTraceExporter) marshalSpans(spans []sdktrace.ReadOnlySpan) (buf []
 	for pbIdx, pbSpan := range protoSpans {
 		pbSizeOffset := len(buf)
 		buf = append(buf, 0, 0, 0, 0) // reserve 4 bytes for span size
-		if buf, err = x.marshalOpts.MarshalAppend(buf, pbSpan); nil != err {
+		if buf, err = x.cfg.marshalOpts.MarshalAppend(buf, pbSpan); nil != err {
 			err = fmt.Errorf("cannot marshal %d-th span: %w", pbIdx, err)
 			return
 		}
@@ -238,6 +280,8 @@ func (x *FilesTraceExporter) ExportSpans(
 	if nil != err {
 		return
 	}
+	x.lckOutput.Lock()
+	defer x.lckOutput.Unlock()
 	if err = x.prepareOutputFp(len(buf)); nil != err {
 		return
 	}
@@ -247,6 +291,7 @@ func (x *FilesTraceExporter) ExportSpans(
 	if _, err = x.outputFp.Write(buf); nil != err {
 		err = fmt.Errorf("cannot write %d spans to output file %q: %w", spanCount, x.outputFileName, err)
 	}
+	x.outputLastWriteAt = time.Now().UTC()
 	return
 }
 
@@ -259,7 +304,7 @@ func (x *FilesTraceExporter) Shutdown(ctx context.Context) (err error) {
 		errS = append(errS, err1)
 	}
 	if len(errS) > 0 {
-		err = fmt.Errorf("cannot shutdown exporter: %w", errors.Join(errS...))
+		err = fmt.Errorf("caught failure on shutdown exporter: %w", errors.Join(errS...))
 	}
 	return
 }
