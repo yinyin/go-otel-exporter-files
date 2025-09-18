@@ -39,3 +39,4 @@ Icon
 *.out
 .glide/
 
+/gen-trace
