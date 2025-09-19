@@ -71,7 +71,7 @@ func ImportTraceFolder(ctx context.Context, client otlptrace.Client, folderPath 
 		return
 	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.Type().IsRegular() {
 			continue
 		}
 		fileName := entry.Name()
