@@ -40,3 +40,5 @@ Icon
 .glide/
 
 /gen-trace
+/import-trace
+
