@@ -198,7 +198,7 @@ func (x *FilesTraceExporter) prepareOutputFolder(outputHour int32) (err error) {
 func (x *FilesTraceExporter) prepareOutputFp(recordSize int) (err error) {
 	outputHour := int32((time.Now().Unix() / 3600) & outputHourMask)
 	if outputHour == x.outputHour {
-		if (x.currentSize != 0) && ((x.currentSize + recordSize) >= x.cfg.fileSizeLimit) {
+		if (x.currentSize != 0) && ((x.currentSize + recordSize) <= x.cfg.fileSizeLimit) {
 			return
 		}
 		if err = x.closeOutputFile(); nil != err {
