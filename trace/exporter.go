@@ -243,7 +243,7 @@ func (x *FilesTraceExporter) prepareOutputFp(recordSize int) (err error) {
 	x.outputFp = fp
 	x.outputStartAt = time.Now().UTC()
 	x.outputLastWriteAt = x.outputStartAt
-	// x.currentSize = 0
+	// x.currentSize = 0	// already set to zero in closeOutputFile
 	return
 }
 
@@ -292,6 +292,7 @@ func (x *FilesTraceExporter) ExportSpans(
 		err = fmt.Errorf("cannot write %d spans to output file %q: %w", spanCount, x.outputFileName, err)
 	}
 	x.outputLastWriteAt = time.Now().UTC()
+	x.currentSize = x.currentSize + len(buf)
 	return
 }
 
