@@ -253,7 +253,7 @@ func (x *FilesTraceExporter) marshalSpans(spans []sdktrace.ReadOnlySpan) (buf []
 	if spanCount == 0 {
 		return
 	}
-	buf = make([]byte, 4) // TODO: make a better guess
+	buf = make([]byte, 4, 4+4096+(spanCount*512)) // TODO: make a better guess
 	binary.LittleEndian.PutUint32(buf, uint32(spanCount))
 	for pbIdx, pbSpan := range protoSpans {
 		pbSizeOffset := len(buf)
