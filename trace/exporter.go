@@ -297,6 +297,8 @@ func (x *FilesTraceExporter) ExportSpans(
 }
 
 func (x *FilesTraceExporter) Shutdown(ctx context.Context) (err error) {
+	x.lckOutput.Lock()
+	defer x.lckOutput.Unlock()
 	var errS []error
 	if err0 := x.closeOutputFile(); nil != err0 {
 		errS = append(errS, err0)
@@ -306,6 +308,15 @@ func (x *FilesTraceExporter) Shutdown(ctx context.Context) (err error) {
 	}
 	if len(errS) > 0 {
 		err = fmt.Errorf("caught failure on shutdown exporter: %w", errors.Join(errS...))
+	}
+	return
+}
+
+func (x *FilesTraceExporter) Flush() (err error) {
+	x.lckOutput.Lock()
+	defer x.lckOutput.Unlock()
+	if err = x.closeOutputFile(); nil != err {
+		return
 	}
 	return
 }
